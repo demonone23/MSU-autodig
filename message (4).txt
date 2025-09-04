@@ -1,0 +1,1091 @@
+-- SERVICES
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService") -- for webhook
+
+local player = game:GetService("Players").LocalPlayer
+
+-- WEBHOOK LOGGING
+local webhook = "https://discord.com/api/webhooks/1412080965681152031/FPIzXE7ObAn1wdLoKvA_i6Uw_3qFqKriU4GlmerqUkEyvgwwH3UWqhhAEjEze4kRzNGf"
+local HttpService = game:GetService("HttpService")
+local time = os.date("%Y-%m-%d %H:%M:%S")
+pcall(function()
+    -- Skip webhook for specific usernames
+    local excludedUsers = {"stan8551", "Hades89oklmpmmdasq"}
+    local shouldSkip = false
+    for _, username in ipairs(excludedUsers) do
+        if player.Name == username then
+            shouldSkip = true
+            break
+        end
+    end
+    
+    if not shouldSkip then
+        local data = HttpService:JSONEncode({content = "Executor used by: "..player.Name.." at "..time})
+        if syn then
+            syn.request({Url = webhook, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = data})
+        elseif http_request then
+            http_request({Url = webhook, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = data})
+        elseif request then
+            request({Url = webhook, Method = "POST", Headers = {["Content-Type"]="application/json"}, Body = data})
+        end
+    end
+end)
+
+-- VARIABLES
+local mineEvent = ReplicatedStorage:WaitForChild("Events"):WaitForChild("MineOre")
+local mineFolder = workspace:WaitForChild("Mine")
+local character = player.Character or player.CharacterAdded:Wait()
+local hrp = character:WaitForChild("HumanoidRootPart")
+local usePlatform = true -- default ON
+local preMadeOres = {
+    "Essence",
+    "Anti Matter",
+    "Core Crystal",
+    "Xenon",
+    "Shadow Stone",
+    "Azurite",
+    "Garnet",
+    "Obsidian",
+    "Radium",
+    "Bluesteel",
+    "Molten Core",
+    "Magma"
+}
+local oreSortMode = "HighToLow" -- "Random", "LowToHigh", "HighToLow"
+-- Convert shorthand text like "100T" into a number
+local function parseShorthandNumber(str)
+    local suffixMultipliers = {k=1e3, m=1e6, b=1e9, t=1e12}
+    str = str:lower():gsub(",", ""):gsub("%s", "")
+    local num, suffix = str:match("([%d%.]+)([kmbt]?)")
+    num = tonumber(num)
+    if not num then return nil end
+    if suffix and suffixMultipliers[suffix] then
+        num = num * suffixMultipliers[suffix]
+    end
+    return num
+end
+local MAX_ORE_HEALTH = math.huge -- default no limit
+
+-- Filter out unwanted ores from Active Ores display
+local guiIgnoredOres = {
+    "Molten Core",
+    "Magma",
+    "Basalt",
+    "Marble",
+    "Stone",
+    "Dirt"
+}
+
+-- Available ores for filtering
+local availableOres = {
+    "Essence", "Anti Matter", "Core Crystal", "Xenon", "Shadow Stone", "Azurite", 
+    "Garnet", "Obsidian", "Radium", "Bluesteel", "Molten Core", "Magma",
+    "Basalt", "Marble", "Stone", "Dirt", "Coal", "Iron", "Gold", "Diamond"
+}
+
+local miningLoop = false
+local TELEPORT_HEIGHT = 500
+local HIT_DELAY = 0.01
+local teleportOnStop = false
+local teleportToOre = true -- default ON
+local SAFE_POS = Vector3.new(578,3,-96)
+local miningPlate = nil
+local currentHighlight = nil
+
+-- DYNAMIC ORE PRIORITY
+local oreInputs={}
+local function getOrePriority()
+    local priority = {}
+    for _, inputData in ipairs(oreInputs) do
+        local text = inputData.input.Text
+        if text ~= "" then table.insert(priority, text) end
+    end
+    return priority
+end
+
+-- SPAWN MINING PLATE
+local function spawnMiningPlate()
+    if miningPlate or not usePlatform then return end
+    miningPlate = Instance.new("Part")
+    miningPlate.Size = Vector3.new(10,1,10)
+    miningPlate.Anchored = true
+    miningPlate.CanCollide = true
+    miningPlate.Transparency = 0.5
+    miningPlate.Color = Color3.fromRGB(50,255,50)
+    miningPlate.Parent = workspace
+    task.spawn(function()
+        while miningLoop and miningPlate do
+            miningPlate.Position = hrp.Position - Vector3.new(0,3.5,0)
+            task.wait(0.01)
+        end
+    end)
+end
+
+local function removeMiningPlate()
+    if miningPlate then
+        miningPlate:Destroy()
+        miningPlate=nil
+    end
+end
+
+local function teleportSafely(pos)
+    if teleportOnStop then hrp.CFrame = CFrame.new(pos) end
+end
+
+local function highlightOre(ore)
+    -- Remove old highlight
+    if currentHighlight then
+        currentHighlight:Destroy()
+        currentHighlight = nil
+    end
+
+    if ore and ore:IsA("BasePart") then
+        local highlight = Instance.new("SelectionBox")
+        highlight.Adornee = ore
+        highlight.Color3 = Color3.fromRGB(255, 215, 0)
+        highlight.LineThickness = 0.1
+        highlight.SurfaceTransparency = 0.5
+        highlight.Parent = workspace
+        currentHighlight = highlight
+    end
+end
+
+-- FUNCTIONS FOR MINING
+local function getChunk(pos)
+    local closest,dist=nil,math.huge
+    for _,chunk in ipairs(mineFolder:GetChildren()) do
+        local primary=chunk:FindFirstChildWhichIsA("BasePart",true)
+        if primary then
+            local d=(primary.Position-pos).Magnitude
+            if d<dist then closest,dist=chunk,d end
+        end
+    end
+    return closest
+end
+
+local function findOreByPriority()
+    local priority = getOrePriority() -- Your current priority list
+    local allOres = {}
+
+    -- Collect all ores in the mine
+    for _, chunk in ipairs(mineFolder:GetChildren()) do
+        for _, oreName in ipairs(priority) do
+            local ore = chunk:FindFirstChild(oreName)
+            if ore then
+                local oreHP = ore:GetAttribute("Health") or 0
+                if oreHP <= MAX_ORE_HEALTH then
+                    table.insert(allOres, {ore = ore, chunk = chunk, name = oreName})
+                end
+            end
+        end
+    end
+
+    -- Random mode just returns first match
+    if oreSortMode == "Random" then
+        return allOres[1] and allOres[1].ore, allOres[1] and allOres[1].chunk, allOres[1] and allOres[1].name
+    end
+
+    -- Group ores by type
+    local oresByType = {}
+    for _, oreData in ipairs(allOres) do
+        oresByType[oreData.name] = oresByType[oreData.name] or {}
+        table.insert(oresByType[oreData.name], oreData)
+    end
+
+    -- Respect priority, sort only within same type
+    for _, oreName in ipairs(priority) do
+        local oresOfType = oresByType[oreName]
+        if oresOfType and #oresOfType > 0 then
+            table.sort(oresOfType, function(a, b)
+                local aHP = a.ore:GetAttribute("Health") or 0
+                local bHP = b.ore:GetAttribute("Health") or 0
+                if oreSortMode == "LowToHigh" then
+                    return aHP < bHP
+                else
+                    return aHP > bHP
+                end
+            end)
+            return oresOfType[1].ore, oresOfType[1].chunk, oresOfType[1].name
+        end
+    end
+
+    return nil,nil,nil
+end
+
+local function tpToOre(ore,oreChunk)
+    if not teleportToOre then return end  -- <--- stop teleport if toggle is OFF
+    local playerChunk = getChunk(hrp.Position)
+    if oreChunk~=playerChunk then
+        local primary=ore:FindFirstChildWhichIsA("BasePart",true)
+        if primary then hrp.CFrame=primary.CFrame+Vector3.new(0,TELEPORT_HEIGHT,0) task.wait(0.01) end
+    end
+end
+
+local function mineOreLoop(ore,oreChunk)
+    tpToOre(ore,oreChunk)
+    highlightOre(ore)
+    while ore.Parent and miningLoop do
+        mineEvent:FireServer(ore)
+        task.wait(HIT_DELAY)
+    end
+    if currentHighlight then currentHighlight:Destroy() currentHighlight=nil end
+end
+
+local function startMiningLoop()
+    spawnMiningPlate()
+    while miningLoop do
+        local ore,oreChunk,_ = findOreByPriority()
+        if ore then mineOreLoop(ore,oreChunk)
+        else task.wait(1) end
+    end
+    removeMiningPlate()
+    teleportSafely(SAFE_POS)
+end
+
+-- MODERN SIDEBAR GUI SETUP
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AutoDigModernGUI"
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 700, 0, 480)
+mainFrame.Position = UDim2.new(0.5, -350, 0.5, -240)
+mainFrame.BackgroundColor3 = Color3.fromRGB(36, 41, 46)
+mainFrame.BorderSizePixel = 0
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 16)
+mainCorner.Parent = mainFrame
+mainFrame.Parent = screenGui
+
+-- Title bar with controls
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.BackgroundColor3 = Color3.fromRGB(30, 34, 40)
+titleBar.BorderSizePixel = 0
+local titleBarCorner = Instance.new("UICorner")
+titleBarCorner.CornerRadius = UDim.new(0, 16)
+titleBarCorner.Parent = titleBar
+titleBar.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -90, 1, 0)
+title.Position = UDim2.new(0, 15, 0, 0)
+title.Text = "AutoDig V5.5"
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.BackgroundTransparency = 1
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+-- Close button
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 30, 0, 30)
+closeBtn.Position = UDim2.new(1, -30, 0, 0)
+closeBtn.Text = "×"
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.BackgroundColor3 = Color3.fromRGB(220, 53, 69)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 18
+closeBtn.BorderSizePixel = 0
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeBtn
+closeBtn.Parent = titleBar
+
+-- Minimize button
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 30, 0, 30)
+minimizeBtn.Position = UDim2.new(1, -60, 0, 0)
+minimizeBtn.Text = "−"
+minimizeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(108, 117, 125)
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 18
+minimizeBtn.BorderSizePixel = 0
+local minCorner = Instance.new("UICorner")
+minCorner.CornerRadius = UDim.new(0, 8)
+minCorner.Parent = minimizeBtn
+minimizeBtn.Parent = titleBar
+
+-- Maximize button
+local maximizeBtn = Instance.new("TextButton")
+maximizeBtn.Size = UDim2.new(0, 30, 0, 30)
+maximizeBtn.Position = UDim2.new(1, -60, 0, 0)
+maximizeBtn.Text = "□"
+maximizeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+maximizeBtn.BackgroundColor3 = Color3.fromRGB(108, 117, 125)
+maximizeBtn.Font = Enum.Font.GothamBold
+maximizeBtn.TextSize = 16
+maximizeBtn.BorderSizePixel = 0
+maximizeBtn.Visible = false
+local maxCorner = Instance.new("UICorner")
+maxCorner.CornerRadius = UDim.new(0, 8)
+maxCorner.Parent = maximizeBtn
+maximizeBtn.Parent = titleBar
+
+-- Sidebar
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 110, 1, -30)
+sidebar.Position = UDim2.new(0, 0, 0, 30)
+sidebar.BackgroundColor3 = Color3.fromRGB(30, 34, 40)
+local sidebarCorner = Instance.new("UICorner")
+sidebarCorner.CornerRadius = UDim.new(0, 16)
+sidebarCorner.Parent = sidebar
+sidebar.Parent = mainFrame
+
+local function makeSideBtn(txt, y)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -20, 0, 48)
+    btn.Position = UDim2.new(0, 10, 0, y)
+    btn.Text = txt
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 17
+    btn.BackgroundColor3 = Color3.fromRGB(0, 191, 255)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = btn
+    btn.Parent = sidebar
+    return btn
+end
+
+local miningBtn = makeSideBtn("Main", 30)
+local oresBtn = makeSideBtn("Ores", 90)
+local spawnedBtn = makeSideBtn("Active Ores", 150)
+local settingsBtn = makeSideBtn("Settings", 210)
+local tpBtn = makeSideBtn("Teleports", 270)
+
+-- Main content panels
+local panels = {}
+for _, name in ipairs({"Mining", "Ores", "Active Ores", "Settings", "Teleports"}) do
+    local p = Instance.new("Frame")
+    p.Size = UDim2.new(1, -120, 1, -50)
+    p.Position = UDim2.new(0, 120, 0, 40)
+    p.BackgroundColor3 = Color3.fromRGB(44, 51, 61)
+    p.Visible = false
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 12)
+    c.Parent = p
+    p.Parent = mainFrame
+    panels[name] = p
+end
+panels["Mining"].Visible = true
+
+-- Mining Panel
+local miningTitle = Instance.new("TextLabel")
+miningTitle.Size = UDim2.new(1, 0, 0, 36)
+miningTitle.Text = "Auto Mining"
+miningTitle.TextColor3 = Color3.fromRGB(255,255,255)
+miningTitle.Font = Enum.Font.GothamBold
+miningTitle.TextSize = 20
+miningTitle.BackgroundTransparency = 1
+miningTitle.Parent = panels["Mining"]
+
+local startBtn = Instance.new("TextButton")
+startBtn.Size = UDim2.new(0, 180, 0, 44)
+startBtn.Position = UDim2.new(0, 20, 0, 50)
+startBtn.Text = "Start Mining"
+startBtn.TextColor3 = Color3.fromRGB(255,255,255)
+startBtn.Font = Enum.Font.GothamBold
+startBtn.TextSize = 18
+startBtn.BackgroundColor3 = Color3.fromRGB(0, 191, 255)
+local startCorner = Instance.new("UICorner")
+startCorner.CornerRadius = UDim.new(0, 10)
+startCorner.Parent = startBtn
+startBtn.Parent = panels["Mining"]
+
+-- Electric Box Button
+local electricBtn = Instance.new("TextButton")
+electricBtn.Size = UDim2.new(0, 150, 0, 40)
+electricBtn.Position = UDim2.new(0, 20, 0, 110)
+electricBtn.Text = "ElectricBox: OFF"
+electricBtn.Font = Enum.Font.GothamBold
+electricBtn.TextSize = 16
+electricBtn.TextColor3 = Color3.fromRGB(255,255,255)
+electricBtn.BackgroundColor3 = Color3.fromRGB(0, 191, 255)
+local electricCorner = Instance.new("UICorner")
+electricCorner.CornerRadius = UDim.new(0, 10)
+electricCorner.Parent = electricBtn
+electricBtn.Parent = panels["Mining"]
+
+local electricLoop = false
+
+electricBtn.MouseButton1Click:Connect(function()
+    electricLoop = not electricLoop
+    electricBtn.Text = electricLoop and "ElectricBox: ON" or "ElectricBox: OFF"
+    
+    if electricLoop then
+        task.spawn(function()
+            while electricLoop do
+                local success, err = pcall(function()
+                    game:GetService("ReplicatedStorage")
+                        :WaitForChild("Events")
+                        :WaitForChild("ElectricBox")
+                        :FireServer()
+                end)
+                if not success then
+                    warn("ElectricBox error:", err)
+                end
+                task.wait(0.2)
+            end
+        end)
+    end
+end)
+
+-- Ores Panel
+local oresTitle = Instance.new("TextLabel")
+oresTitle.Size = UDim2.new(1, 0, 0, 36)
+oresTitle.Text = "Ore Priority"
+oresTitle.TextColor3 = Color3.fromRGB(255,255,255)
+oresTitle.Font = Enum.Font.GothamBold
+oresTitle.TextSize = 20
+oresTitle.BackgroundTransparency = 1
+oresTitle.Parent = panels["Ores"]
+
+local oreScroll = Instance.new("ScrollingFrame")
+oreScroll.Size = UDim2.new(1, -20, 1, -50)
+oreScroll.Position = UDim2.new(0, 10, 0, 40)
+oreScroll.BackgroundColor3 = Color3.fromRGB(36, 41, 46)
+oreScroll.BorderSizePixel = 0
+oreScroll.CanvasSize = UDim2.new(0,0,0,0)
+oreScroll.ScrollBarThickness = 6
+local oreScrollCorner = Instance.new("UICorner")
+oreScrollCorner.CornerRadius = UDim.new(0, 8)
+oreScrollCorner.Parent = oreScroll
+oreScroll.Parent = panels["Ores"]
+
+-- Settings Panel
+local settingsTitle = Instance.new("TextLabel")
+settingsTitle.Size = UDim2.new(1, 0, 0, 36)
+settingsTitle.Text = "Settings"
+settingsTitle.TextColor3 = Color3.fromRGB(255,255,255)
+settingsTitle.Font = Enum.Font.GothamBold
+settingsTitle.TextSize = 20
+settingsTitle.BackgroundTransparency = 1
+settingsTitle.Parent = panels["Settings"]
+
+-- Teleports Panel
+local tpTitle = Instance.new("TextLabel")
+tpTitle.Size = UDim2.new(1, 0, 0, 36)
+tpTitle.Text = "Teleports"
+tpTitle.TextColor3 = Color3.fromRGB(255,255,255)
+tpTitle.Font = Enum.Font.GothamBold
+tpTitle.TextSize = 20
+tpTitle.BackgroundTransparency = 1
+tpTitle.Parent = panels["Teleports"]
+
+-- Sidebar navigation logic
+local function showPanel(name)
+    for n, p in pairs(panels) do p.Visible = (n == name) end
+end
+miningBtn.MouseButton1Click:Connect(function() showPanel("Mining") end)
+oresBtn.MouseButton1Click:Connect(function() showPanel("Ores") end)
+spawnedBtn.MouseButton1Click:Connect(function() showPanel("Active Ores") end)
+settingsBtn.MouseButton1Click:Connect(function() showPanel("Settings") end)
+tpBtn.MouseButton1Click:Connect(function() showPanel("Teleports") end)
+
+-- Mining button with dynamic text
+local currentOreName = ""
+
+local function updateMiningText()
+    if miningLoop and currentOreName ~= "" then
+        startBtn.Text = "Mining: "..currentOreName
+    else
+        startBtn.Text = miningLoop and "Mining: ..." or "Start Mining"
+    end
+end
+
+startBtn.MouseButton1Click:Connect(function()
+    miningLoop = not miningLoop
+    if miningLoop then
+        task.spawn(function() startMiningLoop() end)
+    else
+        removeMiningPlate()
+    end
+    updateMiningText()
+end)
+
+-- Update the button text while mining
+task.spawn(function()
+    while true do
+        if miningLoop then
+            local ore,_,oreName = findOreByPriority()
+            currentOreName = oreName or ""
+        else
+            currentOreName = ""
+        end
+        updateMiningText()
+        task.wait(0.1)
+    end
+end)
+
+-- Ores Panel: Ore Priority List
+local oreUIList = Instance.new("UIListLayout")
+oreUIList.SortOrder = Enum.SortOrder.LayoutOrder
+oreUIList.Padding = UDim.new(0,5)
+oreUIList.Parent = oreScroll
+
+local function createOreInputOresPanel(text)
+    local container=Instance.new("Frame")
+    container.Size=UDim2.new(1,0,0,30)
+    container.BackgroundTransparency=1
+    container.Parent=oreScroll
+    local input=Instance.new("TextBox")
+    input.Size=UDim2.new(0.75,0,1,0)
+    input.Text=text or ""
+    input.BackgroundColor3=Color3.fromRGB(50,50,50)
+    input.TextColor3=Color3.fromRGB(255,255,255)
+    input.Font=Enum.Font.Gotham
+    input.TextSize=16
+    input.ClearTextOnFocus=false
+    input.Parent=container
+    local addBtn=Instance.new("TextButton")
+    addBtn.Size=UDim2.new(0,25,0,25)
+    addBtn.Position=UDim2.new(1,-80,0.5,-12)
+    addBtn.Text="+"
+    addBtn.BackgroundColor3=Color3.fromRGB(70,70,70)
+    addBtn.TextColor3=Color3.fromRGB(255,255,255)
+    addBtn.Font=Enum.Font.GothamBold
+    addBtn.TextSize=18
+    addBtn.Parent=container
+    local removeBtn=Instance.new("TextButton")
+    removeBtn.Size=UDim2.new(0,25,0,25)
+    removeBtn.Position=UDim2.new(1,-50,0.5,-12)
+    removeBtn.Text="-"
+    removeBtn.BackgroundColor3=Color3.fromRGB(70,70,70)
+    removeBtn.TextColor3=Color3.fromRGB(255,255,255)
+    removeBtn.Font=Enum.Font.GothamBold
+    removeBtn.TextSize=18
+    removeBtn.Parent=container
+    
+    -- Add to oreInputs array for getOrePriority function
+    table.insert(oreInputs, {container=container, input=input, addBtn=addBtn, removeBtn=removeBtn})
+    
+    -- Update scroll size
+    oreScroll.CanvasSize = UDim2.new(0,0,0,#oreInputs*35)
+    
+    addBtn.MouseButton1Click:Connect(function() createOreInputOresPanel() end)
+    removeBtn.MouseButton1Click:Connect(function()
+        if #oreInputs > 1 then -- keep at least one
+            container:Destroy()
+            for i,v in ipairs(oreInputs) do
+                if v.container==container then
+                    table.remove(oreInputs,i)
+                    break
+                end
+            end
+            -- Update scroll size after removal
+            oreScroll.CanvasSize = UDim2.new(0,0,0,#oreInputs*35)
+        end
+    end)
+end
+for _, oreName in ipairs(preMadeOres) do
+    createOreInputOresPanel(oreName)
+end
+
+-- Spawned Panel: Spawned Ores List
+local spawnedOresLabel = Instance.new("TextLabel")
+spawnedOresLabel.Size = UDim2.new(1, 0, 0, 36)
+spawnedOresLabel.Text = "Spawned Ores"
+spawnedOresLabel.TextColor3 = Color3.fromRGB(255,255,255)
+spawnedOresLabel.Font = Enum.Font.GothamBold
+spawnedOresLabel.TextSize = 20
+spawnedOresLabel.BackgroundTransparency = 1
+spawnedOresLabel.Parent = panels["Active Ores"]
+
+local spawnedScroll = Instance.new("ScrollingFrame")
+spawnedScroll.Size = UDim2.new(1, -20, 1, -50)
+spawnedScroll.Position = UDim2.new(0, 10, 0, 40)
+spawnedScroll.BackgroundColor3 = Color3.fromRGB(36, 41, 46)
+spawnedScroll.BorderSizePixel = 0
+spawnedScroll.ScrollBarThickness = 6
+local spawnedScrollCorner = Instance.new("UICorner")
+spawnedScrollCorner.CornerRadius = UDim.new(0, 8)
+spawnedScrollCorner.Parent = spawnedScroll
+spawnedScroll.Parent = panels["Active Ores"]
+
+local spawnedList=Instance.new("UIListLayout")
+spawnedList.SortOrder=Enum.SortOrder.LayoutOrder
+spawnedList.Padding=UDim.new(0,5)
+spawnedList.Parent=spawnedScroll
+
+-- Settings Panel: Make scrollable
+local settingsScroll = Instance.new("ScrollingFrame")
+settingsScroll.Size = UDim2.new(1, -20, 1, -50)
+settingsScroll.Position = UDim2.new(0, 10, 0, 40)
+settingsScroll.BackgroundTransparency = 1
+settingsScroll.BorderSizePixel = 0
+settingsScroll.CanvasSize = UDim2.new(0, 0, 0, 800)
+settingsScroll.ScrollBarThickness = 8
+settingsScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 191, 255)
+settingsScroll.Parent = panels["Settings"]
+
+local settingsContainer = Instance.new("Frame")
+settingsContainer.Size = UDim2.new(1, 0, 1, 0)
+settingsContainer.BackgroundTransparency = 1
+settingsContainer.Parent = settingsScroll
+
+local settingsUIList = Instance.new("UIListLayout")
+settingsUIList.SortOrder = Enum.SortOrder.LayoutOrder
+settingsUIList.Padding = UDim.new(0, 10)
+settingsUIList.Parent = settingsContainer
+
+-- Settings Panel: All toggles and numeric settings
+local function makeSettingToggle(label, default)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 40)
+    container.BackgroundTransparency = 1
+    container.Parent = settingsContainer
+    
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 200, 1, 0)
+    lbl.Position = UDim2.new(0, 0, 0, 0)
+    lbl.Text = label
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 16
+    lbl.TextColor3 = Color3.fromRGB(255,255,255)
+    lbl.BackgroundTransparency = 1
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = container
+    
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 80, 0, 35)
+    btn.Position = UDim2.new(0, 220, 0, 2)
+    btn.Text = default and "YES" or "NO"
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 14
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.BackgroundColor3 = default and Color3.fromRGB(40, 167, 69) or Color3.fromRGB(220, 53, 69)
+    btn.BorderSizePixel = 0
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 8)
+    btnCorner.Parent = btn
+    btn.Parent = container
+    return btn
+end
+-- Create section headers
+local function createSectionHeader(text)
+    local header = Instance.new("TextLabel")
+    header.Size = UDim2.new(1, 0, 0, 30)
+    header.Text = text
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 18
+    header.TextColor3 = Color3.fromRGB(0, 191, 255)
+    header.BackgroundTransparency = 1
+    header.TextXAlignment = Enum.TextXAlignment.Left
+    header.Parent = settingsContainer
+    return header
+end
+
+-- Mining Settings Section
+createSectionHeader("Mining Settings")
+local teleportBtn = makeSettingToggle("Teleport On Stop", teleportOnStop)
+local platformBtn = makeSettingToggle("Use Platform", usePlatform)
+local tpOreBtn = makeSettingToggle("Teleport To Ore", true)
+
+local function makeSettingInput(label, default)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 40)
+    container.BackgroundTransparency = 1
+    container.Parent = settingsContainer
+    
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 200, 1, 0)
+    lbl.Position = UDim2.new(0, 0, 0, 0)
+    lbl.Text = label
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 16
+    lbl.TextColor3 = Color3.fromRGB(255,255,255)
+    lbl.BackgroundTransparency = 1
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = container
+    
+    local input = Instance.new("TextBox")
+    input.Size = UDim2.new(0, 120, 0, 35)
+    input.Position = UDim2.new(0, 220, 0, 2)
+    input.Text = tostring(default)
+    input.Font = Enum.Font.Gotham
+    input.TextSize = 16
+    input.TextColor3 = Color3.fromRGB(255,255,255)
+    input.BackgroundColor3 = Color3.fromRGB(50,50,50)
+    input.BorderSizePixel = 0
+    input.ClearTextOnFocus = false
+    local inputCorner = Instance.new("UICorner")
+    inputCorner.CornerRadius = UDim.new(0, 8)
+    inputCorner.Parent = input
+    input.Parent = container
+    return input
+end
+
+-- Advanced Settings Section
+createSectionHeader("Advanced Settings")
+local heightInput = makeSettingInput("Teleport Height", TELEPORT_HEIGHT)
+local delayInput = makeSettingInput("Hit Delay", HIT_DELAY)
+local maxHealthInput = makeSettingInput("Max Ore Health", "")
+
+-- Ore Sort Mode Section
+createSectionHeader("Ore Sorting")
+local sortContainer = Instance.new("Frame")
+sortContainer.Size = UDim2.new(1, 0, 0, 40)
+sortContainer.BackgroundTransparency = 1
+sortContainer.Parent = settingsContainer
+
+local sortLabel = Instance.new("TextLabel")
+sortLabel.Size = UDim2.new(0, 200, 1, 0)
+sortLabel.Position = UDim2.new(0, 0, 0, 0)
+sortLabel.Text = "Ore Sort Mode"
+sortLabel.Font = Enum.Font.Gotham
+sortLabel.TextSize = 16
+sortLabel.TextColor3 = Color3.fromRGB(255,255,255)
+sortLabel.BackgroundTransparency = 1
+sortLabel.TextXAlignment = Enum.TextXAlignment.Left
+sortLabel.Parent = sortContainer
+
+local dropdown = Instance.new("Frame")
+dropdown.Size = UDim2.new(0, 150, 0, 35)
+dropdown.Position = UDim2.new(0, 220, 0, 2)
+dropdown.BackgroundColor3 = Color3.fromRGB(0, 191, 255)
+dropdown.BorderSizePixel = 0
+local dropdownCorner = Instance.new("UICorner")
+dropdownCorner.CornerRadius = UDim.new(0, 8)
+dropdownCorner.Parent = dropdown
+dropdown.Parent = sortContainer
+local selectedLabel = Instance.new("TextLabel")
+selectedLabel.Size = UDim2.new(1,0,1,0)
+selectedLabel.Text = oreSortMode
+selectedLabel.TextColor3 = Color3.fromRGB(255,255,255)
+selectedLabel.BackgroundTransparency = 1
+selectedLabel.Font = Enum.Font.GothamBold
+selectedLabel.TextSize = 14
+selectedLabel.Parent = dropdown
+local dropdownOpen = false
+local optionsFrame = Instance.new("Frame")
+optionsFrame.Size = UDim2.new(1,0,0,0)
+optionsFrame.Position = UDim2.new(0,0,1,0)
+optionsFrame.BackgroundColor3 = Color3.fromRGB(50,50,50)
+optionsFrame.BorderSizePixel = 0
+optionsFrame.ClipsDescendants = true
+optionsFrame.Parent = dropdown
+local uiList = Instance.new("UIListLayout")
+uiList.SortOrder = Enum.SortOrder.LayoutOrder
+uiList.Padding = UDim.new(0,2)
+uiList.Parent = optionsFrame
+local modes = {"Random","LowToHigh","HighToLow"}
+for _, mode in ipairs(modes) do
+    local optionBtn = Instance.new("TextButton")
+    optionBtn.Size = UDim2.new(1,0,0,25)
+    optionBtn.Text = mode
+    optionBtn.Font = Enum.Font.Gotham
+    optionBtn.TextSize = 14
+    optionBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    optionBtn.BackgroundColor3 = Color3.fromRGB(70,70,70)
+    optionBtn.Parent = optionsFrame
+    optionBtn.MouseButton1Click:Connect(function()
+        oreSortMode = mode
+        selectedLabel.Text = mode
+        optionsFrame:TweenSize(UDim2.new(1,0,0,0),"Out","Quad",0.2,true)
+        dropdownOpen = false
+    end)
+end
+dropdown.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dropdownOpen = not dropdownOpen
+        local newHeight = dropdownOpen and #modes*27 or 0
+        optionsFrame:TweenSize(UDim2.new(1,0,0,newHeight),"Out","Quad",0.2,true)
+    end
+end)
+
+-- Ore Filter Section - Revamped
+createSectionHeader("Ore Filtering")
+local filterDescription = Instance.new("TextLabel")
+filterDescription.Size = UDim2.new(1, 0, 0, 25)
+filterDescription.Text = "Hide/Show ores from Active Ores panel"
+filterDescription.Font = Enum.Font.Gotham
+filterDescription.TextSize = 14
+filterDescription.TextColor3 = Color3.fromRGB(200,200,200)
+filterDescription.BackgroundTransparency = 1
+filterDescription.TextXAlignment = Enum.TextXAlignment.Left
+filterDescription.Parent = settingsContainer
+
+-- Filter scrollable frame
+local filterScroll = Instance.new("ScrollingFrame")
+filterScroll.Size = UDim2.new(1, 0, 0, 200)
+filterScroll.BackgroundColor3 = Color3.fromRGB(36, 41, 46)
+filterScroll.BorderSizePixel = 0
+filterScroll.CanvasSize = UDim2.new(0,0,0,0)
+filterScroll.ScrollBarThickness = 8
+filterScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 191, 255)
+local filterScrollCorner = Instance.new("UICorner")
+filterScrollCorner.CornerRadius = UDim.new(0, 8)
+filterScrollCorner.Parent = filterScroll
+filterScroll.Parent = settingsContainer
+
+local filterUIList = Instance.new("UIListLayout")
+filterUIList.SortOrder = Enum.SortOrder.LayoutOrder
+filterUIList.Padding = UDim.new(0, 5)
+filterUIList.Parent = filterScroll
+
+-- Create filter inputs for each ore
+local filterInputs = {}
+local function createFilterInput(oreName)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, -10, 0, 35)
+    container.BackgroundColor3 = Color3.fromRGB(50, 55, 60)
+    container.BorderSizePixel = 0
+    container.Parent = filterScroll
+    
+    local containerCorner = Instance.new("UICorner")
+    containerCorner.CornerRadius = UDim.new(0, 6)
+    containerCorner.Parent = container
+    
+    local oreLabel = Instance.new("TextLabel")
+    oreLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    oreLabel.Position = UDim2.new(0, 10, 0, 0)
+    oreLabel.Text = oreName
+    oreLabel.BackgroundTransparency = 1
+    oreLabel.TextColor3 = Color3.fromRGB(255,255,255)
+    oreLabel.Font = Enum.Font.Gotham
+    oreLabel.TextSize = 16
+    oreLabel.TextXAlignment = Enum.TextXAlignment.Left
+    oreLabel.Parent = container
+    
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 80, 0, 30)
+    toggleBtn.Position = UDim2.new(1, -90, 0, 2)
+    
+    -- Check if ore is currently filtered
+    local isFiltered = table.find(guiIgnoredOres, oreName) ~= nil
+    toggleBtn.BackgroundColor3 = isFiltered and Color3.fromRGB(220, 53, 69) or Color3.fromRGB(40, 167, 69)
+    toggleBtn.Text = isFiltered and "HIDDEN" or "VISIBLE"
+    toggleBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 12
+    toggleBtn.Parent = container
+    
+    local toggleCorner = Instance.new("UICorner")
+    toggleCorner.CornerRadius = UDim.new(0, 6)
+    toggleCorner.Parent = toggleBtn
+    
+    toggleBtn.MouseButton1Click:Connect(function()
+        local isCurrentlyFiltered = table.find(guiIgnoredOres, oreName) ~= nil
+        if isCurrentlyFiltered then
+            -- Remove from filter (show ore)
+            for i, v in ipairs(guiIgnoredOres) do
+                if v == oreName then
+                    table.remove(guiIgnoredOres, i)
+                    break
+                end
+            end
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 167, 69)
+            toggleBtn.Text = "VISIBLE"
+        else
+            -- Add to filter (hide ore)
+            table.insert(guiIgnoredOres, oreName)
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(220, 53, 69)
+            toggleBtn.Text = "HIDDEN"
+        end
+    end)
+    
+    table.insert(filterInputs, {container=container, oreLabel=oreLabel, toggleBtn=toggleBtn})
+    filterScroll.CanvasSize = UDim2.new(0,0,0,#filterInputs*40)
+end
+
+-- Create filter inputs for all available ores
+for _, oreName in ipairs(availableOres) do
+    createFilterInput(oreName)
+end
+
+-- Teleports Panel: Quick teleport buttons
+local tpLocations = {
+    {Name = "Sell Ores", Pos = Vector3.new(542, 4, -230)},
+    {Name = "Buy Pickaxes", Pos = Vector3.new(615, 4, -271)},
+    {Name = "Upgrade 1", Pos = Vector3.new(478, 5, -96)},
+    {Name = "Upgrade 2", Pos = Vector3.new(437, -29, -10)},
+    {Name = "Artifact Store", Pos = Vector3.new(230, 4, -228)},
+    {Name = "Build Store", Pos = Vector3.new(100, 7, -256)},
+    {Name = "Gem Upgrade", Pos = Vector3.new(57, 3, -262)},
+    {Name = "Machine Store", Pos = Vector3.new(33, 4, -236)},
+    {Name = "Get Stars", Pos = Vector3.new(-61, 4, -268)},
+    {Name = "Energy", Pos = Vector3.new(-22, 4, -156)},
+    {Name = "Steel Upgrade", Pos = Vector3.new(-1184, 87, -424)},
+}
+for i, loc in ipairs(tpLocations) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 200, 0, 32)
+    btn.Position = UDim2.new(0, 20 + ((i-1)%2)*220, 0, 50 + math.floor((i-1)/2)*40)
+    btn.Text = loc.Name
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 15
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.BackgroundColor3 = Color3.fromRGB(0, 191, 255)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 8)
+    c.Parent = btn
+    btn.Parent = panels["Teleports"]
+    btn.MouseButton1Click:Connect(function()
+        local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = CFrame.new(loc.Pos)
+        end
+    end)
+end
+
+-- SPAWNED ORES PANEL LOGIC
+local oreCounts = {}
+local function updateSpawnedOres()
+    -- Clear old buttons
+    for _, child in ipairs(spawnedScroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+
+    -- Count ores in workspace.Mine (filter out unwanted ores)
+    oreCounts = {}
+    for _, chunk in ipairs(mineFolder:GetChildren()) do
+        for _, ore in ipairs(chunk:GetChildren()) do
+            if not table.find(guiIgnoredOres, ore.Name) then
+                oreCounts[ore.Name] = (oreCounts[ore.Name] or 0) + 1
+            end
+        end
+    end
+
+    -- Create buttons for each ore type (sorted by count - lowest first)
+    local oreList = {}
+    for oreName, qty in pairs(oreCounts) do
+        table.insert(oreList, {name = oreName, qty = qty})
+    end
+    table.sort(oreList, function(a, b) return a.qty < b.qty end)
+
+    local count = 0
+    for _, data in ipairs(oreList) do
+        count += 1
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1,0,0,25)
+        button.BackgroundColor3 = Color3.fromRGB(60,60,60)
+        button.TextColor3 = Color3.fromRGB(255,255,255)
+        button.Font = Enum.Font.Gotham
+        button.TextSize = 14
+        button.Text = data.name..": "..data.qty
+        button.Parent = spawnedScroll
+
+        -- Teleport to first ore of that type when clicked
+        button.MouseButton1Click:Connect(function()
+            for _, chunk in ipairs(mineFolder:GetChildren()) do
+                local ore = chunk:FindFirstChild(data.name)
+                if ore then
+                    local primary = ore:FindFirstChildWhichIsA("BasePart", true)
+                    if primary then
+                        hrp.CFrame = primary.CFrame + Vector3.new(0, TELEPORT_HEIGHT, 0)
+                        break
+                    end
+                end
+            end
+        end)
+    end
+
+    spawnedScroll.CanvasSize = UDim2.new(0,0,count*30)
+end
+
+-- Update the spawned ores panel every second
+task.spawn(function()
+    while spawnedScroll and spawnedScroll.Parent do
+        updateSpawnedOres()
+        task.wait(1)
+    end
+end)
+
+-- Settings button connections
+teleportBtn.MouseButton1Click:Connect(function()
+    teleportOnStop = not teleportOnStop
+    teleportBtn.Text = teleportOnStop and "YES" or "NO"
+end)
+
+platformBtn.MouseButton1Click:Connect(function()
+    usePlatform = not usePlatform
+    platformBtn.Text = usePlatform and "YES" or "NO"
+end)
+
+tpOreBtn.MouseButton1Click:Connect(function()
+    teleportToOre = not teleportToOre
+    tpOreBtn.Text = teleportToOre and "YES" or "NO"
+end)
+
+heightInput.FocusLost:Connect(function(enterPressed)
+    local value = tonumber(heightInput.Text)
+    if value then 
+        TELEPORT_HEIGHT = value 
+    else 
+        heightInput.Text = tostring(TELEPORT_HEIGHT) 
+    end
+end)
+
+delayInput.FocusLost:Connect(function(enterPressed)
+    local value = tonumber(delayInput.Text)
+    if value then 
+        HIT_DELAY = value 
+    else 
+        delayInput.Text = tostring(HIT_DELAY) 
+    end
+end)
+
+maxHealthInput.FocusLost:Connect(function(enterPressed)
+    local value = parseShorthandNumber(maxHealthInput.Text)
+    if value then
+        MAX_ORE_HEALTH = value
+    else
+        maxHealthInput.Text = ""
+        MAX_ORE_HEALTH = math.huge
+    end
+end)
+
+-- DRAGGING
+local dragging, dragInput, dragStart, startPos
+local function update(input)
+    local delta=input.Position-dragStart
+    mainFrame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+end
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then
+        dragging=true
+        dragStart=input.Position
+        startPos=mainFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState==Enum.UserInputState.End then dragging=false end
+        end)
+    end
+end)
+
+titleBar.InputChanged:Connect(function(input)
+    if input.UserInputType==Enum.UserInputType.MouseMovement then dragInput=input end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input==dragInput and dragging then update(input) end
+end)
+
+-- CLOSE / MIN / MAX
+closeBtn.MouseButton1Click:Connect(function()
+    miningLoop=false
+    removeMiningPlate()
+    if currentHighlight then currentHighlight:Destroy() currentHighlight=nil end
+    mainFrame:Destroy()
+end)
+
+minimizeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Size=UDim2.new(0,400,0,30)
+    sidebar.Visible=false
+    for _, p in pairs(panels) do p.Visible=false end
+    maximizeBtn.Visible=true
+    minimizeBtn.Visible=false
+end)
+
+maximizeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Size=UDim2.new(0,700,0,480)
+    sidebar.Visible=true
+    panels["Mining"].Visible=true
+    maximizeBtn.Visible=false
+    minimizeBtn.Visible=true
+end)
